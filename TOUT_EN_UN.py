@@ -42,7 +42,7 @@ def ouvrir_fichier(dossier, nom_fichier):
             afficher_message(console)
 
 def explore_launch(requete):
-    dossier = 'C:/Users/nosyr/Music'
+    dossier = 'C:/Users/XXXXX/Music'
     if requete.strip() == "":  # Vérifie si la requête est vide ou composée uniquement d'espaces
         console = "Aucune requête fournie."
         afficher_message(console)
@@ -82,7 +82,7 @@ def test_reseau(url='http://www.google.com/', timeout=5):
         return False
 
 def rechercher_et_lancer_premiere_video(requete):
-    API_KEY = 'AIzaSyA96LoLgITOIFw20CDp3IyPTp5ENANr4bA'
+    API_KEY = 'XXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
     YOUTUBE_API_SERVICE_NAME = 'youtube'
     YOUTUBE_API_VERSION = 'v3'
 
@@ -113,8 +113,8 @@ def ouvrir_navigateur_avec_lien(entree):
 
 def chat_loop(question):
     while True:
-        reponse = ollama.chat(model="phi3", messages=[{'role': 'user', 'content': question}])
-        ia_reponse = ("phi3 : " + reponse['message']['content'])
+        reponse = ollama.chat(model="XXXXX", messages=[{'role': 'user', 'content': question}])
+        ia_reponse = ("XXXXX : " + reponse['message']['content'])
         afficher_message(ia_reponse)
         break
 
