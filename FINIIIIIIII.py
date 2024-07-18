@@ -20,7 +20,7 @@ resultat = ""
 
 def load_stt_model():
     """ Fonction pour charger le modèle STT """
-    model_path = r'C:\Users\nosyr\PycharmProject\Code_With_AI\vosk-model-small-fr-0.22'
+    model_path = r'CHEMIN/vers/le/model/de/langage/vosk'
     model = Model(model_path)
     return KaldiRecognizer(model, 16000)
 
@@ -111,7 +111,7 @@ def ouvrir_fichier(dossier, nom_fichier):
 
 
 def explore_launch(requete):
-    dossier = 'C:/Users/nosyr/Music'
+    dossier = 'C:/Users/xxxxxxxx/Music1Videos&Photos'
     if requete.strip() == "":  # Vérifie si la requête est vide ou composée uniquement d'espaces
         console = "Aucune requête fournie."
         afficher_message(console)
@@ -154,7 +154,7 @@ def test_reseau(url='http://www.google.com/', timeout=5):
 
 
 def rechercher_et_lancer_premiere_video(requete):
-    API_KEY = 'AIzaSyA96LoLgITOIFw20CDp3IyPTp5ENANr4bA'
+    API_KEY = 'XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
     YOUTUBE_API_SERVICE_NAME = 'youtube'
     YOUTUBE_API_VERSION = 'v3'
 
