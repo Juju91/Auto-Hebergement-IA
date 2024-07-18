@@ -41,7 +41,7 @@ def ouvrir_fichier(dossier, nom_fichier):
             afficher_message(console)
 
 def explore_launch(requete):
-    dossier = 'C:/Users/nosyr/Music'
+    dossier = 'C:/Users/XXXXXXX/Music'
     if requete.strip() == "":  # Vérifie si la requête est vide ou composée uniquement d'espaces
         console = "Aucune requête fournie."
         afficher_message(console)
@@ -81,7 +81,7 @@ def test_reseau(url='http://www.google.com/', timeout=5):
         return False
 
 def rechercher_et_lancer_premiere_video(requete):
-    API_KEY = 'AIzaSyA96LoLgITOIFw20CDp3IyPTp5ENANr4bA'
+    API_KEY = 'XXXXXXXXXXXXXXXXXXXx'
     YOUTUBE_API_SERVICE_NAME = 'youtube'
     YOUTUBE_API_VERSION = 'v3'
 
