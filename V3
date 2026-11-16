@@ -1,0 +1,748 @@
+"""
+Assistant virtuel : Gemini (si internet) ou Ollama (local) + Vosk (STT) + pyttsx3 (TTS)
+Interface moderne (customtkinter), réponse en streaming, bouton stop, fenêtre de paramètres.
+
+Installation :
+    pip install customtkinter ollama requests pyaudio vosk pyttsx3 google-api-python-client
+"""
+import json
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+import webbrowser
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote_plus
+
+import customtkinter as ctk
+import ollama
+import requests
+
+# Modules optionnels : l'appli démarre même s'ils manquent
+try:
+    import pyaudio
+    from vosk import Model, KaldiRecognizer
+    STT_OK = True
+except ImportError:
+    STT_OK = False
+try:
+    import pyttsx3
+    TTS_OK = True
+except ImportError:
+    TTS_OK = False
+
+# ───────────────────────── PARAMÈTRES ─────────────────────────
+SETTINGS_FILE = Path(__file__).with_name("settings.json")
+
+DEFAULTS = {
+    "mode": "auto",                      # auto | gemini | local
+    "gemini_key": "",                    # ou variable d'environnement GEMINI_API_KEY
+    "gemini_model": "gemini-2.5-flash",  # modifiable dans les paramètres
+    "ollama_model": "gemma:2b",
+    "system_prompt": "Tu es un assistant virtuel utile. Réponds en français, "
+                     "de façon claire et concise.",
+    "wake_words": "eureka, solara, jarvis, nimbus, celeste",
+    "media_folder": r"C:/Users/xxxxxxxx/Music1Videos&Photos",
+    "vosk_path": r"CHEMIN/vers/le/model/de/langage/vosk",
+    "youtube_key": "",
+}
+
+MAX_HISTORY = 12  # nombre de messages gardés en mémoire pour le contexte
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:{method}"
+
+DATE_HEURE_KEYS = ["quelle heure", "l'heure", "quel jour", "date d'aujourd", "date d aujourd"]
+INTERNET_KEYS = ["cherche", "sur youtube"]
+
+# Palette
+BG = "#0f1115"
+PANEL = "#171a21"
+INPUT_BG = "#1e222b"
+HOVER = "#2a2f3b"
+ACCENT = "#6c8cff"
+ACCENT_HOVER = "#5273ee"
+DANGER = "#e5484d"
+DANGER_HOVER = "#c93a3f"
+TEXT = "#e6e8ee"
+MUTED = "#8a91a3"
+USER_COLOR = "#9db4ff"
+AI_COLOR = "#7ee0b0"
+
+ctk.set_appearance_mode("dark")
+
+
+def load_settings():
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+    except (FileNotFoundError, ValueError):
+        pass
+    return cfg
+
+
+def save_settings(cfg):
+    SETTINGS_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(SETTINGS_FILE, 0o600)  # la clé API reste lisible par vous seul (Linux/macOS)
+    except OSError:
+        pass
+
+
+def describe_error(e):
+    if isinstance(e, (requests.ConnectionError, requests.Timeout)):
+        return "pas de connexion internet"
+    return str(e)[:160]
+
+
+# ═════════════════════════ Fenêtre de paramètres ═════════════════════════
+class SettingsWindow(ctk.CTkToplevel):
+    MODES = {"Auto (Gemini si internet)": "auto", "Gemini uniquement": "gemini",
+             "Local uniquement (Ollama)": "local"}
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Paramètres")
+        self.geometry("580x700")
+        self.configure(fg_color=BG)
+        self.transient(app)
+        self.entries = {}
+
+        body = ctk.CTkScrollableFrame(self, fg_color=BG)
+        body.pack(fill="both", expand=True, padx=12, pady=(12, 0))
+        cfg = app.cfg
+
+        self._section(body, "Intelligence artificielle")
+        ctk.CTkLabel(body, text="Mode", text_color=MUTED, anchor="w").pack(fill="x", padx=8)
+        self.mode_menu = ctk.CTkSegmentedButton(body, values=list(self.MODES),
+                                                selected_color=ACCENT,
+                                                selected_hover_color=ACCENT_HOVER,
+                                                fg_color=INPUT_BG)
+        inv = {v: k for k, v in self.MODES.items()}
+        self.mode_menu.set(inv.get(cfg["mode"], "Auto (Gemini si internet)"))
+        self.mode_menu.pack(fill="x", padx=8, pady=(2, 10))
+
+        self._field(body, "Clé API Gemini", "gemini_key", show="•",
+                    hint="Gratuite sur aistudio.google.com/apikey")
+        self.show_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(body, text="Afficher la clé", variable=self.show_var,
+                        command=self._toggle_key, text_color=MUTED,
+                        fg_color=ACCENT).pack(anchor="w", padx=8, pady=(0, 8))
+        self._field(body, "Modèle Gemini", "gemini_model",
+                    hint="Ex : gemini-2.5-flash (rapide) ou gemini-2.5-pro (plus puissant)")
+        self._field(body, "Modèle Ollama (local, secours)", "ollama_model")
+
+        ctk.CTkLabel(body, text="Personnalité (prompt système)", text_color=MUTED,
+                     anchor="w").pack(fill="x", padx=8, pady=(6, 0))
+        self.prompt_box = ctk.CTkTextbox(body, height=90, fg_color=INPUT_BG, text_color=TEXT)
+        self.prompt_box.pack(fill="x", padx=8, pady=(2, 8))
+        self.prompt_box.insert("1.0", cfg["system_prompt"])
+
+        self._section(body, "Voix & commandes")
+        self._field(body, "Mots de réveil (séparés par des virgules)", "wake_words")
+        self._field(body, "Dossier média (commande « lance »)", "media_folder")
+        self._field(body, "Chemin du modèle Vosk (reconnaissance vocale)", "vosk_path")
+        self._field(body, "Clé API YouTube (facultatif)", "youtube_key", show="•")
+
+        bar = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0)
+        bar.pack(fill="x")
+        ctk.CTkButton(bar, text="Tester Gemini", fg_color=INPUT_BG, hover_color=HOVER,
+                      command=self._test).pack(side="left", padx=12, pady=12)
+        ctk.CTkButton(bar, text="Enregistrer", fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=self._save).pack(side="right", padx=12, pady=12)
+        ctk.CTkButton(bar, text="Annuler", fg_color="transparent", border_width=1,
+                      border_color=MUTED, text_color=MUTED, hover_color=INPUT_BG,
+                      command=self.destroy).pack(side="right", pady=12)
+
+        self.after(150, self._grab)
+
+    def _grab(self):
+        try:
+            self.lift()
+            self.grab_set()
+        except Exception:
+            pass
+
+    def _section(self, parent, title):
+        ctk.CTkLabel(parent, text=title, font=ctk.CTkFont(size=15, weight="bold"),
+                     text_color=ACCENT, anchor="w").pack(fill="x", padx=8, pady=(14, 6))
+
+    def _field(self, parent, label, key, show=None, hint=None):
+        ctk.CTkLabel(parent, text=label, text_color=MUTED, anchor="w").pack(fill="x", padx=8)
+        e = ctk.CTkEntry(parent, fg_color=INPUT_BG, border_width=0, text_color=TEXT,
+                         show=show or "", height=34)
+        e.pack(fill="x", padx=8, pady=(2, 2 if hint else 8))
+        e.insert(0, self.app.cfg.get(key, ""))
+        self.entries[key] = e
+        if hint:
+            ctk.CTkLabel(parent, text=hint, text_color=MUTED, anchor="w",
+                         font=ctk.CTkFont(size=11)).pack(fill="x", padx=8, pady=(0, 8))
+
+    def _toggle_key(self):
+        self.entries["gemini_key"].configure(show="" if self.show_var.get() else "•")
+
+    def _collect(self):
+        data = {k: e.get().strip() for k, e in self.entries.items()}
+        data["mode"] = self.MODES[self.mode_menu.get()]
+        data["system_prompt"] = self.prompt_box.get("1.0", "end").strip() \
+            or DEFAULTS["system_prompt"]
+        return data
+
+    def _test(self):
+        d = self._collect()
+        self.app.test_gemini(d["gemini_key"] or os.environ.get("GEMINI_API_KEY", ""),
+                             d["gemini_model"])
+
+    def _save(self):
+        self.app.cfg.update(self._collect())
+        save_settings(self.app.cfg)
+        self.app.post("sys", "Paramètres enregistrés.")
+        self.app.post("status", "")
+        self.destroy()
+
+
+# ═════════════════════════ Application ═════════════════════════
+class Assistant(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.cfg = load_settings()
+        self.title("Assistant")
+        self.geometry("900x700")
+        self.minsize(620, 480)
+        self.configure(fg_color=BG)
+
+        self.ui_queue = queue.Queue()
+        self.history = []
+        self.generating = False
+        self.stop_event = threading.Event()
+        self.backend_label = None  # dernier moteur utilisé
+
+        self.tts_queue = queue.Queue()
+        self.tts_enabled = False
+        self.tts_buffer = ""
+
+        self.stt_active = False
+        self.stt_stop = threading.Event()
+        self.stt_thread = None
+
+        self._build_ui()
+        self._poll_queue()
+
+        if TTS_OK:
+            threading.Thread(target=self._tts_worker, daemon=True).start()
+
+        self.post("sys", "Bonjour ! Écrivez un message ou activez le micro. "
+                         f"Mots de réveil : {', '.join(self.wake_words())}.")
+        if self.cfg["mode"] != "local" and not self.gemini_key():
+            self.post("sys", "Astuce : ajoutez une clé API Gemini dans ⚙ Paramètres pour des "
+                             "réponses plus rapides et plus intelligentes.")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ───────────────────────── Helpers config ─────────────────────────
+    def gemini_key(self):
+        return self.cfg["gemini_key"] or os.environ.get("GEMINI_API_KEY", "")
+
+    def wake_words(self):
+        return [w.strip().lower() for w in self.cfg["wake_words"].split(",") if w.strip()]
+
+    def _idle_status(self):
+        if self.backend_label:
+            return f"● {self.backend_label}"
+        mode = self.cfg["mode"]
+        if mode == "local":
+            return f"● {self.cfg['ollama_model']} (local)"
+        if mode == "gemini":
+            return f"● {self.cfg['gemini_model']}"
+        return "● Auto" if self.gemini_key() else f"● {self.cfg['ollama_model']} (local)"
+
+    # ───────────────────────── Interface ─────────────────────────
+    def _build_ui(self):
+        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=56)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        ctk.CTkLabel(header, text="✦  Assistant", font=ctk.CTkFont(size=18, weight="bold"),
+                     text_color=TEXT).pack(side="left", padx=20)
+
+        self.btn_settings = ctk.CTkButton(header, text="⚙", width=34, height=28,
+                                          fg_color="transparent", hover_color=INPUT_BG,
+                                          text_color=TEXT, font=ctk.CTkFont(size=18),
+                                          command=self.open_settings)
+        self.btn_settings.pack(side="right", padx=(0, 14))
+        self.btn_clear = ctk.CTkButton(header, text="Effacer", width=70, height=28,
+                                       fg_color="transparent", border_width=1,
+                                       border_color=MUTED, text_color=MUTED,
+                                       hover_color=INPUT_BG, command=self.clear_chat)
+        self.btn_clear.pack(side="right", padx=(0, 8))
+        self.status = ctk.CTkLabel(header, text=self._idle_status(), text_color=MUTED,
+                                   font=ctk.CTkFont(size=12))
+        self.status.pack(side="right", padx=14)
+
+        self.chat = ctk.CTkTextbox(self, fg_color=BG, text_color=TEXT, wrap="word",
+                                   font=ctk.CTkFont(size=14), border_width=0,
+                                   scrollbar_button_color=INPUT_BG)
+        self.chat.pack(fill="both", expand=True, padx=24, pady=(14, 6))
+        t = self.chat._textbox
+        t.tag_config("user_name", foreground=USER_COLOR, font=("Segoe UI", 11, "bold"),
+                     spacing1=10)
+        t.tag_config("ai_name", foreground=AI_COLOR, font=("Segoe UI", 11, "bold"), spacing1=10)
+        t.tag_config("user_text", foreground=TEXT, lmargin1=8, lmargin2=8, spacing3=6)
+        t.tag_config("ai_text", foreground=TEXT, lmargin1=8, lmargin2=8, spacing3=6)
+        t.tag_config("sys", foreground=MUTED, font=("Segoe UI", 11, "italic"), spacing1=6,
+                     spacing3=6)
+        self.chat.configure(state="disabled")
+
+        bar = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=18)
+        bar.pack(fill="x", padx=24, pady=(6, 20))
+
+        self.btn_mic = ctk.CTkButton(bar, text="🎙", width=40, height=40, corner_radius=20,
+                                     fg_color=INPUT_BG, hover_color=HOVER,
+                                     font=ctk.CTkFont(size=16), command=self.toggle_stt)
+        self.btn_mic.pack(side="left", padx=(10, 4), pady=10)
+        self.btn_tts = ctk.CTkButton(bar, text="🔈", width=40, height=40, corner_radius=20,
+                                     fg_color=INPUT_BG, hover_color=HOVER,
+                                     font=ctk.CTkFont(size=16), command=self.toggle_tts)
+        self.btn_tts.pack(side="left", padx=4, pady=10)
+
+        self.entry = ctk.CTkEntry(bar, placeholder_text="Écrivez votre message…", height=40,
+                                  corner_radius=20, fg_color=INPUT_BG, border_width=0,
+                                  text_color=TEXT, font=ctk.CTkFont(size=14))
+        self.entry.pack(side="left", fill="x", expand=True, padx=8, pady=10)
+        self.entry.bind("<Return>", lambda e: self.on_send())
+        self.entry.focus()
+
+        self.btn_send = ctk.CTkButton(bar, text="Envoyer", width=96, height=40, corner_radius=20,
+                                      fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                      font=ctk.CTkFont(size=14, weight="bold"),
+                                      command=self.on_send)
+        self.btn_send.pack(side="right", padx=(4, 10), pady=10)
+        self.bind("<Escape>", lambda e: self.stop_generation())
+
+    def open_settings(self):
+        if getattr(self, "_settings_win", None) and self._settings_win.winfo_exists():
+            self._settings_win.focus()
+            return
+        self._settings_win = SettingsWindow(self)
+
+    def _set_send_mode(self, generating):
+        if generating:
+            self.btn_send.configure(text="■ Stop", fg_color=DANGER, hover_color=DANGER_HOVER,
+                                    command=self.stop_generation)
+            self.status.configure(text="● réflexion…", text_color=ACCENT)
+        else:
+            self.btn_send.configure(text="Envoyer", fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                    command=self.on_send)
+            self.status.configure(text=self._idle_status(), text_color=MUTED)
+
+    # ───────────────────── Affichage thread-safe ─────────────────────
+    def post(self, kind, text=""):
+        """Peut être appelé depuis n'importe quel thread."""
+        self.ui_queue.put((kind, text))
+
+    def _poll_queue(self):
+        try:
+            for _ in range(200):
+                kind, text = self.ui_queue.get_nowait()
+                self._handle_event(kind, text)
+        except queue.Empty:
+            pass
+        self.after(25, self._poll_queue)
+
+    def _append(self, text, tag):
+        self.chat.configure(state="normal")
+        self.chat._textbox.insert("end", text, tag)
+        self.chat.configure(state="disabled")
+        self.chat.see("end")
+
+    def _handle_event(self, kind, text):
+        if kind == "user":
+            self._append("Vous\n", "user_name")
+            self._append(text + "\n", "user_text")
+        elif kind == "sys":
+            self._append(text + "\n", "sys")
+        elif kind == "ai_start":
+            self._append(f"Assistant · {text}\n" if text else "Assistant\n", "ai_name")
+        elif kind == "token":
+            self._append(text, "ai_text")
+        elif kind == "ai_end":
+            self._append("\n", "ai_text")
+        elif kind == "reply":
+            self._append("Assistant\n", "ai_name")
+            self._append(text + "\n", "ai_text")
+            self.speak(text)
+        elif kind == "busy":
+            self.generating = (text == "1")
+            self._set_send_mode(self.generating)
+        elif kind == "status":
+            if text:
+                self.backend_label = text
+            if not self.generating:
+                self.status.configure(text=self._idle_status())
+        elif kind == "stt_cmd":
+            self.on_voice(text)
+        elif kind == "stt_state":
+            self._apply_stt_state(text == "1")
+
+    # ───────────────────────── Envoi / commandes ─────────────────────────
+    def on_send(self):
+        text = self.entry.get().strip()
+        if not text or self.generating:
+            return
+        self.entry.delete(0, "end")
+        self.run_command(text)
+
+    def on_voice(self, spoken):
+        low = spoken.lower()
+        for w in self.wake_words():
+            if w in low:
+                cmd = low.replace(w, "", 1).strip()
+                if cmd and not self.generating:
+                    self.run_command(cmd)
+                return
+
+    def run_command(self, text):
+        self.post("user", text)
+        self.post("busy", "1")
+        self.stop_event.clear()
+        threading.Thread(target=self._dispatch, args=(text,), daemon=True).start()
+
+    def clear_chat(self):
+        if self.generating:
+            return
+        self.history.clear()
+        self.chat.configure(state="normal")
+        self.chat.delete("1.0", "end")
+        self.chat.configure(state="disabled")
+
+    # ───────────────────────── Dispatch (thread) ─────────────────────────
+    @staticmethod
+    def _has(text, keys):
+        return any(k in text for k in keys)
+
+    def _dispatch(self, text):
+        low = text.lower()
+        try:
+            if low == "/bye":
+                self.after(0, self._on_close)
+            elif self._has(low, INTERNET_KEYS):
+                self._cmd_internet(low)
+            elif self._has(low, DATE_HEURE_KEYS):
+                self._cmd_date(low)
+            elif re.search(r"\blance\b", low):
+                self._cmd_launch(re.sub(r"\blance\b", "", low).strip())
+            else:
+                self._cmd_chat(text)
+        except Exception as e:
+            self.post("sys", f"Erreur : {e}")
+        finally:
+            self.post("busy", "0")
+
+    def _cmd_date(self, low):
+        now = datetime.now()
+        if "heure" in low:
+            self.post("reply", f"Il est {now.strftime('%H:%M:%S')}.")
+        else:
+            self.post("reply", f"On est le {now.strftime('%d-%m-%Y')}.")
+
+    def _cmd_internet(self, low):
+        if "youtube" in low:
+            q = low.replace("sur youtube", "").replace("cherche", "").strip()
+            self._youtube(q)
+        else:
+            q = low.replace("cherche", "").strip()
+            webbrowser.open(f"https://www.google.com/search?q={quote_plus(q)}", new=2)
+            self.post("reply", f"Recherche lancée : {q}")
+
+    def _youtube(self, q):
+        key = self.cfg["youtube_key"]
+        if key:
+            from googleapiclient.discovery import build
+            yt = build("youtube", "v3", developerKey=key)
+            res = yt.search().list(q=q, part="snippet", maxResults=1, type="video").execute()
+            if res["items"]:
+                url = f"https://www.youtube.com/watch?v={res['items'][0]['id']['videoId']}"
+                webbrowser.open(url)
+                self.post("reply", f"Vidéo lancée : {url}")
+                return
+            self.post("reply", "Aucune vidéo trouvée.")
+        else:
+            webbrowser.open(f"https://www.youtube.com/results?search_query={quote_plus(q)}")
+            self.post("reply", f"Recherche YouTube : {q}")
+
+    def _cmd_launch(self, query):
+        folder = self.cfg["media_folder"]
+        if not query:
+            self.post("reply", "Aucune requête fournie.")
+            return
+        if not os.path.isdir(folder):
+            self.post("reply", "Le dossier média n'existe pas (voir ⚙ Paramètres).")
+            return
+        words = query.split()
+        found = [f for f in os.listdir(folder) if all(w in f.lower() for w in words)]
+        if len(found) == 1:
+            path = os.path.join(folder, found[0])
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+            self.post("reply", f"{found[0]} ouvert.")
+        elif found:
+            self.post("reply", "Plusieurs fichiers trouvés :\n" + "\n".join(f"• {f}" for f in found))
+        else:
+            self.post("reply", "Aucun fichier trouvé avec ces mots-clés.")
+
+    # ───────────────────────── Moteurs d'IA (streaming) ─────────────────────────
+    def _stream_gemini(self, hist):
+        """Générateur de morceaux de texte via l'API REST de Gemini (SSE)."""
+        url = GEMINI_URL.format(model=self.cfg["gemini_model"],
+                                method="streamGenerateContent") + "?alt=sse"
+        body = {
+            "systemInstruction": {"parts": [{"text": self.cfg["system_prompt"]}]},
+            "contents": [{"role": "user" if m["role"] == "user" else "model",
+                          "parts": [{"text": m["content"]}]} for m in hist],
+        }
+        resp = requests.post(url, json=body, stream=True, timeout=(5, 60),
+                             headers={"x-goog-api-key": self.gemini_key(),
+                                      "Content-Type": "application/json"})
+        try:
+            if resp.status_code != 200:
+                msg = resp.text[:200]
+                try:
+                    msg = resp.json()["error"]["message"]
+                except Exception:
+                    pass
+                raise RuntimeError(f"HTTP {resp.status_code} : {msg}")
+            resp.encoding = "utf-8"
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                data = json.loads(payload)
+                for cand in data.get("candidates", []):
+                    for part in cand.get("content", {}).get("parts", []):
+                        if part.get("text"):
+                            yield part["text"]
+        finally:
+            resp.close()
+
+    def _stream_ollama(self, hist):
+        messages = [{"role": "system", "content": self.cfg["system_prompt"]}] + hist
+        stream = ollama.chat(model=self.cfg["ollama_model"], messages=messages, stream=True)
+        try:
+            for chunk in stream:
+                yield chunk["message"]["content"]
+        finally:
+            close = getattr(stream, "close", None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    pass
+
+    def _consume(self, gen, label):
+        """Affiche un flux token par token. Lève une exception si rien n'a pu démarrer
+        (permet de basculer sur un autre moteur). Retourne le texte produit."""
+        started = False
+        answer = ""
+        try:
+            for token in gen:
+                if self.stop_event.is_set():
+                    break
+                if not started:
+                    self.post("ai_start", label)
+                    started = True
+                answer += token
+                self.post("token", token)
+                self._tts_feed(token)
+            if started and self.stop_event.is_set():
+                self.post("token", " […]")
+        except Exception as e:
+            if not started:
+                raise
+            self.post("token", f"\n[Flux interrompu : {describe_error(e)}]")
+        finally:
+            try:
+                gen.close()
+            except Exception:
+                pass
+            if started:
+                self._tts_flush()
+                self.post("ai_end")
+        return answer
+
+    def _cmd_chat(self, question):
+        self.history.append({"role": "user", "content": question})
+        hist = self.history[-MAX_HISTORY:]
+        mode = self.cfg["mode"]
+        answer = None
+
+        if mode in ("auto", "gemini"):
+            if self.gemini_key():
+                try:
+                    answer = self._consume(self._stream_gemini(hist),
+                                           self.cfg["gemini_model"])
+                    self.post("status", self.cfg["gemini_model"])
+                except Exception as e:
+                    why = describe_error(e)
+                    if mode == "auto":
+                        self.post("sys", f"Gemini indisponible ({why}) → bascule sur le "
+                                         f"modèle local.")
+                    else:
+                        self.post("sys", f"Gemini indisponible ({why}).")
+            elif mode == "gemini":
+                self.post("sys", "Aucune clé API Gemini : ouvrez ⚙ Paramètres.")
+
+        if answer is None and mode != "gemini":
+            try:
+                label = f"{self.cfg['ollama_model']} · local"
+                answer = self._consume(self._stream_ollama(hist), label)
+                self.post("status", f"{self.cfg['ollama_model']} (local)")
+            except Exception as e:
+                self.post("sys", f"Erreur Ollama : {describe_error(e)}. Ollama est-il lancé "
+                                 f"et le modèle « {self.cfg['ollama_model']} » installé ?")
+
+        if answer:
+            self.history.append({"role": "assistant", "content": answer})
+        else:
+            self.history.pop()  # question sans réponse : on ne la garde pas dans le contexte
+            if self.stop_event.is_set():
+                self.post("sys", "Génération interrompue.")
+
+    def stop_generation(self):
+        if self.generating:
+            self.stop_event.set()
+            self._tts_clear()
+
+    def test_gemini(self, key, model):
+        def run():
+            if not key:
+                self.post("sys", "Test Gemini : aucune clé renseignée.")
+                return
+            try:
+                r = requests.post(GEMINI_URL.format(model=model, method="generateContent"),
+                                  headers={"x-goog-api-key": key},
+                                  json={"contents": [{"parts": [{"text": "Réponds : OK"}]}]},
+                                  timeout=(5, 20))
+                if r.status_code == 200:
+                    self.post("sys", f"✓ Gemini fonctionne ({model}).")
+                else:
+                    try:
+                        msg = r.json()["error"]["message"]
+                    except Exception:
+                        msg = r.text[:150]
+                    self.post("sys", f"✗ Test Gemini échoué : HTTP {r.status_code} – {msg}")
+            except Exception as e:
+                self.post("sys", f"✗ Test Gemini échoué : {describe_error(e)}")
+        self.post("sys", "Test de la connexion Gemini…")
+        threading.Thread(target=run, daemon=True).start()
+
+    # ───────────────────────── TTS ─────────────────────────
+    def toggle_tts(self):
+        if not TTS_OK:
+            self.post("sys", "pyttsx3 n'est pas installé.")
+            return
+        self.tts_enabled = not self.tts_enabled
+        self.btn_tts.configure(text="🔊" if self.tts_enabled else "🔈",
+                               fg_color=ACCENT if self.tts_enabled else INPUT_BG)
+        if not self.tts_enabled:
+            self._tts_clear()
+
+    def speak(self, text):
+        if self.tts_enabled and TTS_OK:
+            self.tts_queue.put(text)
+
+    def _tts_feed(self, token):
+        """Lit la réponse phrase par phrase pendant le streaming."""
+        if not (self.tts_enabled and TTS_OK):
+            return
+        self.tts_buffer += token
+        m = re.search(r"(.+?[.!?\n])\s", self.tts_buffer, re.S)
+        while m:
+            self.tts_queue.put(m.group(1).strip())
+            self.tts_buffer = self.tts_buffer[m.end():]
+            m = re.search(r"(.+?[.!?\n])\s", self.tts_buffer, re.S)
+
+    def _tts_flush(self):
+        if self.tts_enabled and TTS_OK and self.tts_buffer.strip() \
+                and not self.stop_event.is_set():
+            self.tts_queue.put(self.tts_buffer.strip())
+        self.tts_buffer = ""
+
+    def _tts_clear(self):
+        self.tts_buffer = ""
+        try:
+            while True:
+                self.tts_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _tts_worker(self):
+        engine = pyttsx3.init()  # initialisé dans son propre thread
+        while True:
+            text = self.tts_queue.get()
+            if text is None:
+                break
+            if self.tts_enabled:
+                try:
+                    engine.say(text)
+                    engine.runAndWait()
+                except Exception:
+                    pass
+
+    # ───────────────────────── STT ─────────────────────────
+    def toggle_stt(self):
+        if not STT_OK:
+            self.post("sys", "pyaudio / vosk ne sont pas installés.")
+            return
+        if self.stt_active:
+            self.stt_stop.set()
+            self._apply_stt_state(False)
+        else:
+            self.stt_stop.clear()
+            self.post("sys", "Chargement du modèle vocal…")
+            self.stt_thread = threading.Thread(target=self._stt_loop, daemon=True)
+            self.stt_thread.start()
+
+    def _apply_stt_state(self, active):
+        self.stt_active = active
+        self.btn_mic.configure(fg_color=DANGER if active else INPUT_BG,
+                               hover_color=DANGER_HOVER if active else HOVER)
+        self.post("sys", "Micro activé." if active else "Micro désactivé.")
+
+    def _stt_loop(self):
+        try:
+            rec = KaldiRecognizer(Model(self.cfg["vosk_path"]), 16000)
+            pa = pyaudio.PyAudio()
+            stream = pa.open(format=pyaudio.paInt16, channels=1, rate=16000,
+                             input=True, frames_per_buffer=8000)
+        except Exception as e:
+            self.post("sys", f"Impossible de démarrer le micro : {e}")
+            return
+        self.post("stt_state", "1")
+        try:
+            while not self.stt_stop.is_set():
+                data = stream.read(4000, exception_on_overflow=False)
+                if rec.AcceptWaveform(data):
+                    text = json.loads(rec.Result()).get("text", "").strip()
+                    if text:
+                        self.post("stt_cmd", text)
+        finally:
+            stream.stop_stream()
+            stream.close()
+            pa.terminate()
+
+    # ───────────────────────── Fermeture ─────────────────────────
+    def _on_close(self):
+        self.stop_event.set()
+        self.stt_stop.set()
+        self.tts_queue.put(None)
+        self.destroy()
+
+
+if __name__ == "__main__":
+    Assistant().mainloop()
