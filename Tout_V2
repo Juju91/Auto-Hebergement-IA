@@ -1,0 +1,459 @@
+"""
+Assistant virtuel local : Ollama + Vosk (STT) + pyttsx3 (TTS)
+Interface moderne (customtkinter), réponse en streaming, bouton stop.
+
+Installation :
+    pip install customtkinter ollama pyaudio vosk pyttsx3 requests google-api-python-client
+"""
+import json
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+import webbrowser
+from datetime import datetime
+from urllib.parse import quote_plus
+
+import customtkinter as ctk
+import ollama
+
+# Modules optionnels : l'appli démarre même s'ils manquent
+try:
+    import pyaudio
+    from vosk import Model, KaldiRecognizer
+    STT_OK = True
+except ImportError:
+    STT_OK = False
+try:
+    import pyttsx3
+    TTS_OK = True
+except ImportError:
+    TTS_OK = False
+
+# ───────────────────────── CONFIGURATION ─────────────────────────
+OLLAMA_MODEL = "gemma:2b"
+VOSK_MODEL_PATH = r"CHEMIN/vers/le/model/de/langage/vosk"
+MEDIA_FOLDER = r"C:/Users/xxxxxxxx/Music1Videos&Photos"
+YOUTUBE_API_KEY = ""          # facultatif : sans clé, ouvre la page de résultats YouTube
+WAKE_WORDS = ["eureka", "solara", "jarvis", "nimbus", "celeste"]
+MAX_HISTORY = 12              # nombre de messages gardés en mémoire pour le contexte
+SYSTEM_PROMPT = "Tu es un assistant virtuel utile. Réponds en français, de façon claire et concise."
+
+DATE_HEURE_KEYS = ["quelle heure", "l'heure", "quel jour", "date d'aujourd", "date d aujourd"]
+LAUNCH_KEYS = ["lance"]
+INTERNET_KEYS = ["cherche", "sur youtube"]
+
+# Palette
+BG = "#0f1115"
+PANEL = "#171a21"
+INPUT_BG = "#1e222b"
+ACCENT = "#6c8cff"
+ACCENT_HOVER = "#5273ee"
+DANGER = "#e5484d"
+DANGER_HOVER = "#c93a3f"
+TEXT = "#e6e8ee"
+MUTED = "#8a91a3"
+USER_COLOR = "#9db4ff"
+AI_COLOR = "#7ee0b0"
+
+ctk.set_appearance_mode("dark")
+
+
+class Assistant(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Assistant")
+        self.geometry("900x700")
+        self.minsize(620, 480)
+        self.configure(fg_color=BG)
+
+        # File d'événements : les threads y postent, le thread UI les lit
+        self.ui_queue = queue.Queue()
+        self.history = []
+        self.generating = False
+        self.stop_event = threading.Event()
+
+        # TTS
+        self.tts_queue = queue.Queue()
+        self.tts_enabled = False
+        self.tts_buffer = ""
+
+        # STT
+        self.stt_active = False
+        self.stt_stop = threading.Event()
+        self.stt_thread = None
+
+        self._build_ui()
+        self._poll_queue()
+
+        if TTS_OK:
+            threading.Thread(target=self._tts_worker, daemon=True).start()
+
+        self.post("sys", "Bonjour ! Écrivez un message ou activez le micro. "
+                         f"Mots de réveil : {', '.join(WAKE_WORDS)}.")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ───────────────────────── Interface ─────────────────────────
+    def _build_ui(self):
+        # En-tête
+        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=56)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        ctk.CTkLabel(header, text="✦  Assistant", font=ctk.CTkFont(size=18, weight="bold"),
+                     text_color=TEXT).pack(side="left", padx=20)
+        self.status = ctk.CTkLabel(header, text=f"● {OLLAMA_MODEL}", text_color=MUTED,
+                                   font=ctk.CTkFont(size=12))
+        self.status.pack(side="right", padx=20)
+
+        self.btn_clear = ctk.CTkButton(header, text="Effacer", width=70, height=28,
+                                       fg_color="transparent", border_width=1,
+                                       border_color=MUTED, text_color=MUTED,
+                                       hover_color=INPUT_BG, command=self.clear_chat)
+        self.btn_clear.pack(side="right", padx=(0, 8))
+
+        # Zone de chat
+        self.chat = ctk.CTkTextbox(self, fg_color=BG, text_color=TEXT, wrap="word",
+                                   font=ctk.CTkFont(size=14), border_width=0,
+                                   scrollbar_button_color=INPUT_BG)
+        self.chat.pack(fill="both", expand=True, padx=24, pady=(14, 6))
+        t = self.chat._textbox  # widget tk sous-jacent, pour les tags de style
+        t.tag_config("user_name", foreground=USER_COLOR, font=("Segoe UI", 11, "bold"),
+                     spacing1=10)
+        t.tag_config("ai_name", foreground=AI_COLOR, font=("Segoe UI", 11, "bold"), spacing1=10)
+        t.tag_config("user_text", foreground=TEXT, lmargin1=8, lmargin2=8, spacing3=6)
+        t.tag_config("ai_text", foreground=TEXT, lmargin1=8, lmargin2=8, spacing3=6)
+        t.tag_config("sys", foreground=MUTED, font=("Segoe UI", 11, "italic"), spacing1=6,
+                     spacing3=6)
+        self.chat.configure(state="disabled")
+
+        # Barre de saisie
+        bar = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=18)
+        bar.pack(fill="x", padx=24, pady=(6, 20))
+
+        self.btn_mic = ctk.CTkButton(bar, text="🎙", width=40, height=40, corner_radius=20,
+                                     fg_color=INPUT_BG, hover_color="#2a2f3b",
+                                     font=ctk.CTkFont(size=16), command=self.toggle_stt)
+        self.btn_mic.pack(side="left", padx=(10, 4), pady=10)
+
+        self.btn_tts = ctk.CTkButton(bar, text="🔈", width=40, height=40, corner_radius=20,
+                                     fg_color=INPUT_BG, hover_color="#2a2f3b",
+                                     font=ctk.CTkFont(size=16), command=self.toggle_tts)
+        self.btn_tts.pack(side="left", padx=4, pady=10)
+
+        self.entry = ctk.CTkEntry(bar, placeholder_text="Écrivez votre message…", height=40,
+                                  corner_radius=20, fg_color=INPUT_BG, border_width=0,
+                                  text_color=TEXT, font=ctk.CTkFont(size=14))
+        self.entry.pack(side="left", fill="x", expand=True, padx=8, pady=10)
+        self.entry.bind("<Return>", lambda e: self.on_send())
+        self.entry.focus()
+
+        self.btn_send = ctk.CTkButton(bar, text="Envoyer", width=96, height=40, corner_radius=20,
+                                      fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                      font=ctk.CTkFont(size=14, weight="bold"),
+                                      command=self.on_send)
+        self.btn_send.pack(side="right", padx=(4, 10), pady=10)
+        self.bind("<Escape>", lambda e: self.stop_generation())
+
+    def _set_send_mode(self, generating):
+        if generating:
+            self.btn_send.configure(text="■ Stop", fg_color=DANGER, hover_color=DANGER_HOVER,
+                                    command=self.stop_generation)
+            self.status.configure(text="● réflexion…", text_color=ACCENT)
+        else:
+            self.btn_send.configure(text="Envoyer", fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                    command=self.on_send)
+            self.status.configure(text=f"● {OLLAMA_MODEL}", text_color=MUTED)
+
+    # ───────────────────── Affichage thread-safe ─────────────────────
+    def post(self, kind, text=""):
+        """Peut être appelé depuis n'importe quel thread."""
+        self.ui_queue.put((kind, text))
+
+    def _poll_queue(self):
+        try:
+            for _ in range(200):  # borne pour ne jamais bloquer l'UI
+                kind, text = self.ui_queue.get_nowait()
+                self._handle_event(kind, text)
+        except queue.Empty:
+            pass
+        self.after(25, self._poll_queue)
+
+    def _append(self, text, tag):
+        self.chat.configure(state="normal")
+        self.chat._textbox.insert("end", text, tag)
+        self.chat.configure(state="disabled")
+        self.chat.see("end")
+
+    def _handle_event(self, kind, text):
+        if kind == "user":
+            self._append("Vous\n", "user_name")
+            self._append(text + "\n", "user_text")
+        elif kind == "sys":
+            self._append(text + "\n", "sys")
+        elif kind == "ai_start":
+            self._append("Assistant\n", "ai_name")
+        elif kind == "token":
+            self._append(text, "ai_text")
+        elif kind == "ai_end":
+            self._append("\n", "ai_text")
+        elif kind == "reply":  # réponse complète d'une commande locale
+            self._append("Assistant\n", "ai_name")
+            self._append(text + "\n", "ai_text")
+            self.speak(text)
+        elif kind == "busy":
+            self.generating = (text == "1")
+            self._set_send_mode(self.generating)
+        elif kind == "stt_cmd":
+            self.on_voice(text)
+        elif kind == "stt_state":
+            self._apply_stt_state(text == "1")
+
+    # ───────────────────────── Envoi / commandes ─────────────────────────
+    def on_send(self):
+        text = self.entry.get().strip()
+        if not text or self.generating:
+            return
+        self.entry.delete(0, "end")
+        self.run_command(text)
+
+    def on_voice(self, spoken):
+        low = spoken.lower()
+        for w in WAKE_WORDS:
+            if w in low:
+                cmd = low.replace(w, "", 1).strip()
+                if cmd and not self.generating:
+                    self.run_command(cmd)
+                return
+
+    def run_command(self, text):
+        self.post("user", text)
+        self.post("busy", "1")
+        self.stop_event.clear()
+        threading.Thread(target=self._dispatch, args=(text,), daemon=True).start()
+
+    def clear_chat(self):
+        if self.generating:
+            return
+        self.history.clear()
+        self.chat.configure(state="normal")
+        self.chat.delete("1.0", "end")
+        self.chat.configure(state="disabled")
+
+    # ───────────────────────── Dispatch (thread) ─────────────────────────
+    @staticmethod
+    def _has(text, keys):
+        return any(k in text for k in keys)
+
+    def _dispatch(self, text):
+        low = text.lower()
+        try:
+            if low == "/bye":
+                self.after(0, self._on_close)
+            elif self._has(low, INTERNET_KEYS):
+                self._cmd_internet(low)
+            elif self._has(low, DATE_HEURE_KEYS):
+                self._cmd_date(low)
+            elif re.search(r"\blance\b", low):
+                self._cmd_launch(re.sub(r"\blance\b", "", low).strip())
+            else:
+                self._cmd_chat(text)
+        except Exception as e:
+            self.post("sys", f"Erreur : {e}")
+        finally:
+            self.post("busy", "0")
+
+    def _cmd_date(self, low):
+        now = datetime.now()
+        if "heure" in low:
+            self.post("reply", f"Il est {now.strftime('%H:%M:%S')}.")
+        else:
+            self.post("reply", f"On est le {now.strftime('%d-%m-%Y')}.")
+
+    def _cmd_internet(self, low):
+        if "youtube" in low:
+            q = low.replace("sur youtube", "").replace("cherche", "").strip()
+            self._youtube(q)
+        else:
+            q = low.replace("cherche", "").strip()
+            webbrowser.open(f"https://www.google.com/search?q={quote_plus(q)}", new=2)
+            self.post("reply", f"Recherche lancée : {q}")
+
+    def _youtube(self, q):
+        if YOUTUBE_API_KEY:
+            from googleapiclient.discovery import build
+            yt = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+            res = yt.search().list(q=q, part="snippet", maxResults=1, type="video").execute()
+            if res["items"]:
+                url = f"https://www.youtube.com/watch?v={res['items'][0]['id']['videoId']}"
+                webbrowser.open(url)
+                self.post("reply", f"Vidéo lancée : {url}")
+                return
+            self.post("reply", "Aucune vidéo trouvée.")
+        else:
+            webbrowser.open(f"https://www.youtube.com/results?search_query={quote_plus(q)}")
+            self.post("reply", f"Recherche YouTube : {q}")
+
+    def _cmd_launch(self, query):
+        if not query:
+            self.post("reply", "Aucune requête fournie.")
+            return
+        if not os.path.isdir(MEDIA_FOLDER):
+            self.post("reply", "Le dossier média n'existe pas (voir MEDIA_FOLDER).")
+            return
+        words = query.split()
+        found = [f for f in os.listdir(MEDIA_FOLDER) if all(w in f.lower() for w in words)]
+        if len(found) == 1:
+            path = os.path.join(MEDIA_FOLDER, found[0])
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            else:
+                subprocess.Popen(["xdg-open", path])
+            self.post("reply", f"{found[0]} ouvert.")
+        elif found:
+            self.post("reply", "Plusieurs fichiers trouvés :\n" + "\n".join(f"• {f}" for f in found))
+        else:
+            self.post("reply", "Aucun fichier trouvé avec ces mots-clés.")
+
+    # ───────────────────────── Chat Ollama en streaming ─────────────────────────
+    def _cmd_chat(self, question):
+        self.history.append({"role": "user", "content": question})
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self.history[-MAX_HISTORY:]
+        answer = ""
+        self.post("ai_start")
+        try:
+            stream = ollama.chat(model=OLLAMA_MODEL, messages=messages, stream=True)
+            for chunk in stream:
+                if self.stop_event.is_set():
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    break
+                token = chunk["message"]["content"]
+                answer += token
+                self.post("token", token)
+                self._tts_feed(token)
+        except Exception as e:
+            self.post("token", f"\n[Erreur Ollama : {e}]\nOllama est-il lancé ? Le modèle "
+                               f"« {OLLAMA_MODEL} » est-il installé ?")
+        finally:
+            self._tts_flush()
+            if self.stop_event.is_set():
+                self.post("token", " […]")
+            self.post("ai_end")
+            if answer:
+                self.history.append({"role": "assistant", "content": answer})
+
+    def stop_generation(self):
+        if self.generating:
+            self.stop_event.set()
+            self._tts_clear()
+
+    # ───────────────────────── TTS ─────────────────────────
+    def toggle_tts(self):
+        if not TTS_OK:
+            self.post("sys", "pyttsx3 n'est pas installé.")
+            return
+        self.tts_enabled = not self.tts_enabled
+        self.btn_tts.configure(text="🔊" if self.tts_enabled else "🔈",
+                               fg_color=ACCENT if self.tts_enabled else INPUT_BG)
+        if not self.tts_enabled:
+            self._tts_clear()
+
+    def speak(self, text):
+        if self.tts_enabled and TTS_OK:
+            self.tts_queue.put(text)
+
+    def _tts_feed(self, token):
+        """Lit la réponse phrase par phrase pendant le streaming."""
+        if not (self.tts_enabled and TTS_OK):
+            return
+        self.tts_buffer += token
+        m = re.search(r"(.+?[.!?\n])\s", self.tts_buffer, re.S)
+        while m:
+            self.tts_queue.put(m.group(1).strip())
+            self.tts_buffer = self.tts_buffer[m.end():]
+            m = re.search(r"(.+?[.!?\n])\s", self.tts_buffer, re.S)
+
+    def _tts_flush(self):
+        if self.tts_enabled and TTS_OK and self.tts_buffer.strip() \
+                and not self.stop_event.is_set():
+            self.tts_queue.put(self.tts_buffer.strip())
+        self.tts_buffer = ""
+
+    def _tts_clear(self):
+        self.tts_buffer = ""
+        try:
+            while True:
+                self.tts_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _tts_worker(self):
+        engine = pyttsx3.init()  # initialisé dans son propre thread
+        while True:
+            text = self.tts_queue.get()
+            if text is None:
+                break
+            if self.tts_enabled:
+                try:
+                    engine.say(text)
+                    engine.runAndWait()
+                except Exception:
+                    pass
+
+    # ───────────────────────── STT ─────────────────────────
+    def toggle_stt(self):
+        if not STT_OK:
+            self.post("sys", "pyaudio / vosk ne sont pas installés.")
+            return
+        if self.stt_active:
+            self.stt_stop.set()
+            self._apply_stt_state(False)
+        else:
+            self.stt_stop.clear()
+            self.post("sys", "Chargement du modèle vocal…")
+            self.stt_thread = threading.Thread(target=self._stt_loop, daemon=True)
+            self.stt_thread.start()
+
+    def _apply_stt_state(self, active):
+        self.stt_active = active
+        self.btn_mic.configure(fg_color=DANGER if active else INPUT_BG,
+                               hover_color=DANGER_HOVER if active else "#2a2f3b")
+        self.post("sys", "Micro activé." if active else "Micro désactivé.")
+
+    def _stt_loop(self):
+        """Tourne dans un thread : charge Vosk puis écoute le micro."""
+        try:
+            rec = KaldiRecognizer(Model(VOSK_MODEL_PATH), 16000)
+            pa = pyaudio.PyAudio()
+            stream = pa.open(format=pyaudio.paInt16, channels=1, rate=16000,
+                             input=True, frames_per_buffer=8000)
+        except Exception as e:
+            self.post("sys", f"Impossible de démarrer le micro : {e}")
+            return
+        self.post("stt_state", "1")
+        try:
+            while not self.stt_stop.is_set():
+                data = stream.read(4000, exception_on_overflow=False)
+                if rec.AcceptWaveform(data):
+                    text = json.loads(rec.Result()).get("text", "").strip()
+                    if text:
+                        self.post("stt_cmd", text)
+        finally:
+            stream.stop_stream()
+            stream.close()
+            pa.terminate()
+
+    # ───────────────────────── Fermeture ─────────────────────────
+    def _on_close(self):
+        self.stop_event.set()
+        self.stt_stop.set()
+        self.tts_queue.put(None)
+        self.destroy()
+
+
+if __name__ == "__main__":
+    Assistant().mainloop()
